@@ -27,7 +27,17 @@ import {
   recoverTransactionController,
   getPendingTransactionsController,
   prepareTransactionController,
+  checkTransactionStatusController,
+  triggerBackgroundProcessingController,
 } from '@/controllers/nest-nest/escrow.controller';
+
+import {
+  getTransactionHealthController,
+  getDeadLetterQueueController,
+  resolveDeadLetterTransactionController,
+  getTransactionMetricsController,
+  emergencyProcessingController,
+} from '@/controllers/nest-nest/transaction-health.controller';
 import { zIntentStatus } from '@/db/models/nige-nest/asset-ledger';
 import { requireNestUserAuth, requireSuperAdminAuth } from '@/middlewares';
 import { ApproveSellGemInput, BreakEggsInput, BuyEggsInput, ConvertGemsInput, RejectSellGemInput } from '@/services/nige-nest/asset-ledger';
@@ -157,4 +167,67 @@ nigeNestEscrowRoutes.post(
     })
   ),
   prepareTransactionController
+);
+
+// Add transaction status check endpoint
+nigeNestEscrowRoutes.post(
+  '/check-transaction-status',
+  requireNestUserAuth,
+  zJsonValidator(
+    z.object({
+      transactionHash: z.string().min(1)
+    })
+  ),
+  checkTransactionStatusController
+);
+
+// Manual background processing trigger (development only)
+nigeNestEscrowRoutes.post(
+  '/trigger-background-processing',
+  requireSuperAdminAuth,
+  triggerBackgroundProcessingController
+);
+
+// === HEALTH MONITORING & ADMIN ENDPOINTS === //
+
+// System health monitoring
+nigeNestEscrowRoutes.get(
+  '/health',
+  requireSuperAdminAuth,
+  getTransactionHealthController
+);
+
+// Transaction processing metrics
+nigeNestEscrowRoutes.get(
+  '/metrics',
+  requireSuperAdminAuth,
+  getTransactionMetricsController
+);
+
+// Dead letter queue management
+nigeNestEscrowRoutes.get(
+  '/dead-letter-queue',
+  requireSuperAdminAuth,
+  getDeadLetterQueueController
+);
+
+// Resolve dead letter transactions
+nigeNestEscrowRoutes.post(
+  '/dead-letter-queue/resolve',
+  requireSuperAdminAuth,
+  zJsonValidator(
+    z.object({
+      deadLetterTxId: z.string().min(1),
+      reviewNotes: z.string().min(1),
+      forceProcess: z.boolean().optional().default(false)
+    })
+  ),
+  resolveDeadLetterTransactionController
+);
+
+// Emergency processing (critical situations)
+nigeNestEscrowRoutes.post(
+  '/emergency-process',
+  requireSuperAdminAuth,
+  emergencyProcessingController
 );

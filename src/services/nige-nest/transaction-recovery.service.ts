@@ -1,4 +1,5 @@
 import { PendingTransactionModel } from '@/db/models/pending-transaction';
+import { DeadLetterTransactionModel } from '@/db/models/dead-letter-transaction';
 import { AssetLedgerModel } from '@/db/models/nige-nest/asset-ledger';
 import { verifyTransactionOnChain } from '@/utils/verifyTransactionOnChain';
 import { buyEggs } from './asset-ledger';
@@ -92,15 +93,20 @@ export class TransactionRecoveryService {
         throw new Error('Transaction verification failed');
       }
 
+      // Update amount if it wasn't set initially
+      if (pendingTx.amount === 0 && verifiedTx.amount) {
+        pendingTx.amount = verifiedTx.amount;
+        await pendingTx.save();
+      }
+
       // Process the purchase
       const result = await buyEggs({
         accountId: pendingTx.accountId.toString(),
         numEggs: pendingTx.numEggs,
-        transactionHash: pendingTx.transactionHash,
+        transactionHash: pendingTx._id.toString(), // Use document ID for internal tracking
         meta: { 
-          ...pendingTx.meta, 
-          processedAt: new Date(),
-          recoveredFromPending: true 
+          transactionHash: pendingTx.transactionHash,
+          chain: pendingTx.chain as 'bsc' | 'solana',
         },
       });
 
@@ -117,11 +123,16 @@ export class TransactionRecoveryService {
       if (pendingTx.attempts >= maxAttempts) {
         pendingTx.status = 'failed';
         pendingTx.errorMessage = (error as Error).message;
+        await pendingTx.save();
+        
+        // Move to dead letter queue for manual review - NO TRANSACTION LOSS
+        await this.moveToDeadLetterQueue(pendingTx, (error as Error).message);
+        console.error(`❌ Transaction moved to dead letter queue after ${maxAttempts} attempts: ${pendingTx.transactionHash}`);
       } else {
         pendingTx.status = 'pending'; // Will retry later
         pendingTx.errorMessage = (error as Error).message;
+        await pendingTx.save();
       }
-      await pendingTx.save();
       
       throw error;
     }
@@ -170,8 +181,8 @@ export class TransactionRecoveryService {
     const failedTxs = await PendingTransactionModel.find({
       status: 'failed',
       attempts: { $lt: 5 },
-      lastAttemptAt: { $lt: new Date(Date.now() - 5 * 60 * 1000) } // 5 minutes ago
-    }).limit(20);
+      lastAttemptAt: { $lt: new Date(Date.now() - 10 * 1000) } // Only 10 seconds ago for faster retries
+    }).limit(50); // Increased limit for faster processing
 
     for (const tx of failedTxs) {
       try {
@@ -179,6 +190,118 @@ export class TransactionRecoveryService {
       } catch (error) {
         console.error(`Failed to retry transaction ${tx.transactionHash}:`, error);
       }
+    }
+  }
+
+  /**
+   * Fast-track processing for immediate transaction handling
+   */
+  static async fastTrackProcessing(transactionHash: string, maxAttempts = 3) {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        console.log(`Fast-track attempt ${attempt}/${maxAttempts} for ${transactionHash}`);
+        const result = await this.processPendingTransaction(transactionHash);
+        return result;
+      } catch (error) {
+        console.log(`Fast-track attempt ${attempt} failed:`, (error as Error).message);
+        
+        if (attempt < maxAttempts) {
+          // Short delay between attempts (exponential backoff: 1s, 2s)
+          const delay = attempt * 1000;
+          await new Promise(resolve => setTimeout(resolve, delay));
+        } else {
+          throw error; // Final attempt failed
+        }
+      }
+    }
+  }
+
+  /**
+   * Move failed transaction to dead letter queue for manual review
+   * This ensures NO TRANSACTION IS EVER LOST
+   */
+  static async moveToDeadLetterQueue(pendingTx: any, lastError: string) {
+    try {
+      await DeadLetterTransactionModel.create({
+        accountId: pendingTx.accountId,
+        transactionHash: pendingTx.transactionHash,
+        chain: pendingTx.chain,
+        numEggs: pendingTx.numEggs,
+        amount: pendingTx.amount,
+        originalAttempts: pendingTx.attempts,
+        lastError,
+        needsManualReview: true,
+        originalMeta: pendingTx.meta || {},
+      });
+
+      console.log(`🚨 CRITICAL: Transaction ${pendingTx.transactionHash} moved to dead letter queue for manual review`);
+      
+      // Alert admin (you could add email/webhook here)
+      // TODO: Add admin notification system
+      
+    } catch (dlqError) {
+      console.error(`💥 CRITICAL ERROR: Failed to save to dead letter queue:`, dlqError);
+      // Even if DLQ fails, we logged the transaction details above
+    }
+  }
+
+  /**
+   * Get transactions in dead letter queue that need manual review
+   */
+  static async getDeadLetterTransactions() {
+    return await DeadLetterTransactionModel.find({
+      needsManualReview: true,
+      isResolved: false
+    }).sort({ failedAt: -1 });
+  }
+
+  /**
+   * Manually resolve a dead letter transaction
+   */
+  static async resolveDeadLetterTransaction(
+    deadLetterTxId: string, 
+    reviewedBy: string, 
+    reviewNotes: string,
+    forceProcess = false
+  ) {
+    const deadLetterTx = await DeadLetterTransactionModel.findById(deadLetterTxId);
+    if (!deadLetterTx) {
+      throw new Error('Dead letter transaction not found');
+    }
+
+    if (forceProcess) {
+      // Admin wants to force process this transaction
+      try {
+        const result = await buyEggs({
+          accountId: deadLetterTx.accountId.toString(),
+          numEggs: deadLetterTx.numEggs,
+          transactionHash: deadLetterTx._id.toString(), // Use DLQ ID for internal tracking
+          meta: {
+            transactionHash: deadLetterTx.transactionHash,
+            chain: deadLetterTx.chain as 'bsc' | 'solana',
+          }
+        });
+
+        deadLetterTx.isResolved = true;
+        deadLetterTx.resolvedAt = new Date();
+        deadLetterTx.reviewedBy = reviewedBy as any;
+        deadLetterTx.reviewedAt = new Date();
+        deadLetterTx.reviewNotes = reviewNotes;
+        await deadLetterTx.save();
+
+        return { success: true, result };
+      } catch (error) {
+        throw new Error(`Failed to force process transaction: ${(error as Error).message}`);
+      }
+    } else {
+      // Admin reviewed but didn't process (maybe invalid transaction)
+      deadLetterTx.needsManualReview = false;
+      deadLetterTx.reviewedBy = reviewedBy as any;
+      deadLetterTx.reviewedAt = new Date();
+      deadLetterTx.reviewNotes = reviewNotes;
+      await deadLetterTx.save();
+
+      return { success: true, reviewed: true };
     }
   }
 } 

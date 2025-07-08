@@ -33,19 +33,19 @@ export const { queue: transactionQueue, worker: transactionWorker } = createQueu
   processPendingTransactionsJob
 );
 
-// Add repeatable job to process transactions every 30 seconds
+// Add repeatable job to process transactions every 3 seconds for fast response
 export const initTransactionProcessing = async () => {
   await transactionQueue.add(
     'process-pending-transactions',
     {},
     {
       repeat: {
-        every: 30000, // 30 seconds
+        every: 3000, // 3 seconds - much faster for sub-5s latency
       },
-      removeOnComplete: 10,
-      removeOnFail: 5,
+      removeOnComplete: 20,
+      removeOnFail: 10,
     }
   );
   
-  console.log('✅ Transaction processing job initialized');
+  console.log('✅ Fast transaction processing job initialized (3s intervals)');
 }; 

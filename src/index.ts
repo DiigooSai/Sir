@@ -5,6 +5,8 @@ import connectDB from './db/connect';
 import { registerWebSocketRoutes } from './ws/web-socketRoutes';
 import { bootstrapRedis } from './db/redis/bootstrap';
 import { initTransactionProcessing } from './bull/jobs/processTransactions';
+import { initImmediateTransactionProcessing } from './bull/jobs/immediateTransactions';
+import { DatabaseFallbackService } from './services/nige-nest/database-fallback.service';
 
 parsedEnv();
 
@@ -15,6 +17,10 @@ await seedDatabase();
 
 // Initialize background transaction processing
 await initTransactionProcessing();
+await initImmediateTransactionProcessing();
+
+// Initialize database fallback monitoring (auto-starts if Redis is down)
+await DatabaseFallbackService.autoStartIfNeeded();
 
 const app = createApp();
 const websocket = registerWebSocketRoutes(app);

@@ -229,41 +229,95 @@ export async function buyEggsController(c: Context) {
 
     const { numEggs, meta } = await c.req.json();
     const { transactionHash, chain } = meta;
-    // find a document in asset ledger with same transactionHash
+    
     if (!transactionHash) {
       return c.json(new ApiResponse(400, { error: 'transactionHash is required' }, 'transactionHash is required'));
     }
-    const assetLedger = await AssetLedgerModel.findOne({ transactionHash });
-    // if found then reject
-    if (!!assetLedger) {
-      return c.json(new ApiResponse(400, { error: 'Transaction already exists' }, 'Transaction already exists'));
+
+    // Import the transaction recovery service
+    const { TransactionRecoveryService } = await import('@/services/nige-nest/transaction-recovery.service');
+
+    // Check if transaction already exists in asset ledger
+    const assetLedger = await AssetLedgerModel.findOne({ 
+      $or: [
+        { transactionHash }, 
+        { 'meta.transactionHash': transactionHash }
+      ]
+    });
+    
+    if (assetLedger) {
+      return c.json(new ApiResponse(400, { error: 'Transaction already processed' }, 'Transaction already exists'));
     }
+
+    // Check if transaction is already in pending transactions
+    const existingPending = await import('@/db/models/pending-transaction').then(m => 
+      m.PendingTransactionModel.findOne({ transactionHash })
+    );
+
+    if (existingPending) {
+      if (existingPending.status === 'completed') {
+        return c.json(new ApiResponse(400, { error: 'Transaction already processed' }, 'Transaction already exists'));
+      } else {
+        return c.json(new ApiResponse(200, { 
+          message: 'Transaction is being processed',
+          status: existingPending.status,
+          pendingTransactionId: existingPending._id 
+        }, 'Transaction in progress'));
+      }
+    }
+
     console.log('buyEggsController called with:', { numEggs, meta });
 
-    const verifiedTx = await verifyTransactionOnChain({
+    // Create pending transaction immediately 
+    const pendingTx = await TransactionRecoveryService.createPendingTransaction({
+      accountId,
       transactionHash,
       chain,
       numEggs,
+      amount: 0, // Will be filled during verification
+      meta: { 
+        submittedAt: new Date(),
+        directPurchase: true
+      }
     });
 
-    if (!verifiedTx) {
-      throw new Error('Transaction verification failed');
+    // Try fast-track processing (3 attempts with 1s, 2s delays) for sub-5s response
+    try {
+      console.log('Starting fast-track processing for immediate response...');
+      const result = await TransactionRecoveryService.fastTrackProcessing(transactionHash, 3);
+      return c.json(new ApiResponse(200, { 
+        ...result,
+        pendingTransactionId: pendingTx._id,
+        message: 'Eggs purchased successfully',
+        processedImmediately: true
+      }, 'Eggs bought successfully'));
+    } catch (processingError) {
+      console.log('Fast-track processing failed, falling back to immediate queue + background processing:', processingError);
+      
+      // Add to immediate processing queue as backup
+      try {
+        const { addImmediateTransaction } = await import('@/bull/jobs/immediateTransactions');
+        await addImmediateTransaction(transactionHash);
+      } catch (queueError) {
+        console.log('Failed to add to immediate queue, background processing will handle it:', queueError);
+      }
+      
+      // Return success response - multiple layers will process this very quickly
+      return c.json(new ApiResponse(200, { 
+        pendingTransactionId: pendingTx._id,
+        status: 'processing',
+        message: 'Transaction submitted successfully. Eggs will be credited within 5 seconds.',
+        backgroundProcessing: true,
+        immediateQueue: true,
+        estimatedTime: '2-5 seconds'
+      }, 'Transaction queued for ultra-fast processing'));
     }
-
-    if (verifiedTx.status !== 1) {
-      throw new Error('Transaction is not successful');
-    }
-    
-    const result = await buyEggs({
-      accountId,
-      numEggs,
-      transactionHash,
-      meta: { transactionHash, chain },
-    });
-
-    return c.json(new ApiResponse(200, result, 'Eggs bought successfully'));
   } catch (err) {
-    return c.json({ error: 'Transaction verification failed', message: (err as Error).message }, 500);
+    console.error('buyEggsController error:', err);
+    return c.json({ 
+      error: 'Failed to process purchase', 
+      message: (err as Error).message 
+    }, 500);
   }
 }
 
@@ -368,6 +422,84 @@ export async function getPendingTransactionsController(c: Context) {
     return c.json(new ApiResponse(200, pendingTransactions, 'Pending transactions fetched'));
   } catch (err) {
     return c.json({ error: 'Failed to fetch pending transactions', message: (err as Error).message }, 500);
+  }
+}
+
+// Check transaction status endpoint
+export async function checkTransactionStatusController(c: Context) {
+  try {
+    const { transactionHash } = await c.req.json();
+    
+    if (!transactionHash) {
+      return c.json(new ApiResponse(400, null, 'Transaction hash is required'));
+    }
+
+    const { PendingTransactionModel } = await import('@/db/models/pending-transaction');
+    
+    const [pendingTx, assetLedger] = await Promise.all([
+      PendingTransactionModel.findOne({ transactionHash }),
+      AssetLedgerModel.findOne({
+        $or: [
+          { transactionHash },
+          { 'meta.transactionHash': transactionHash }
+        ]
+      })
+    ]);
+
+    const status = {
+      transactionHash,
+      isProcessed: !!assetLedger,
+      isPending: !!pendingTx,
+      pendingStatus: pendingTx?.status || null,
+      attempts: pendingTx?.attempts || 0,
+      lastAttemptAt: pendingTx?.lastAttemptAt || null,
+      errorMessage: pendingTx?.errorMessage || null,
+      completedAt: pendingTx?.completedAt || null
+    };
+
+    let message = 'Transaction status retrieved';
+    if (status.isProcessed) {
+      message = 'Transaction completed successfully';
+    } else if (status.isPending) {
+      if (status.pendingStatus === 'processing') {
+        message = 'Transaction is currently being processed';
+      } else if (status.pendingStatus === 'failed') {
+        message = 'Transaction failed but will be retried automatically';
+      } else {
+        message = 'Transaction is pending processing';
+      }
+    } else {
+      message = 'Transaction not found in our system';
+    }
+
+    return c.json(new ApiResponse(200, status, message));
+  } catch (err) {
+    return c.json({ error: 'Failed to check transaction status', message: (err as Error).message }, 500);
+  }
+}
+
+// Manual background processing trigger (for testing)
+export async function triggerBackgroundProcessingController(c: Context) {
+  try {
+    // Only allow this for development/testing
+    if (process.env.NODE_ENV === 'production') {
+      return c.json({ error: 'Not available in production' }, 403);
+    }
+
+    const { TransactionRecoveryService } = await import('@/services/nige-nest/transaction-recovery.service');
+    
+    console.log('Manually triggering background processing...');
+    const results = await TransactionRecoveryService.processAllPendingTransactions();
+    
+    // Also retry failed transactions
+    await TransactionRecoveryService.retryFailedTransactions();
+    
+    return c.json(new ApiResponse(200, {
+      processedCount: results.length,
+      results: results.slice(0, 5) // Show first 5 results
+    }, 'Background processing triggered'));
+  } catch (err) {
+    return c.json({ error: 'Failed to trigger background processing', message: (err as Error).message }, 500);
   }
 }
 

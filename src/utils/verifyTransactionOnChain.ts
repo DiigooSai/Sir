@@ -5,10 +5,59 @@ import { ethers } from 'ethers';
 import { ApiResponse } from './ApiResponse';
 import { AssetLedgerModel } from '@/db/models/nige-nest/asset-ledger';
 
-const CHAIN_RPC_URLS: Record<string, string> = {
-  bsc: 'https://bsc-dataseed.bnbchain.org',
-  solana: clusterApiUrl('mainnet-beta'),
+// Multiple RPC endpoints for redundancy - no single point of failure
+const CHAIN_RPC_URLS: Record<string, string[]> = {
+  bsc: [
+    'https://bsc-dataseed.bnbchain.org',
+    'https://bsc-dataseed1.defibit.io',
+    'https://bsc-dataseed1.ninicoin.io',
+    'https://bsc-dataseed2.defibit.io',
+    'https://bsc-dataseed3.defibit.io',
+    'https://rpc.ankr.com/bsc',
+    'https://bsc.publicnode.com',
+  ],
+  solana: [
+    clusterApiUrl('mainnet-beta'),
+    'https://api.mainnet-beta.solana.com',
+    'https://rpc.ankr.com/solana',
+    'https://solana-api.projectserum.com',
+  ],
 };
+
+// Resilient RPC function - tries multiple endpoints until one works
+async function getWorkingProvider(chain: 'bsc' | 'solana'): Promise<any> {
+  const endpoints = CHAIN_RPC_URLS[chain];
+  let lastError: Error | null = null;
+
+  for (let i = 0; i < endpoints.length; i++) {
+    const endpoint = endpoints[i];
+    try {
+      console.log(`Trying ${chain} RPC endpoint ${i + 1}/${endpoints.length}: ${endpoint}`);
+      
+      if (chain === 'bsc') {
+        const provider = new ethers.JsonRpcProvider(endpoint);
+        // Test the connection
+        await provider.getNetwork();
+        return provider;
+      } else if (chain === 'solana') {
+        const connection = new Connection(endpoint, 'confirmed');
+        // Test the connection
+        await connection.getVersion();
+        return connection;
+      }
+    } catch (error) {
+      console.log(`RPC endpoint ${endpoint} failed:`, (error as Error).message);
+      lastError = error as Error;
+      
+      // If not the last endpoint, continue to next
+      if (i < endpoints.length - 1) {
+        continue;
+      }
+    }
+  }
+  
+  throw new Error(`All ${chain} RPC endpoints failed. Last error: ${lastError?.message}`);
+}
 
 export async function verifyTransactionOnChain({
   transactionHash,
@@ -21,7 +70,7 @@ export async function verifyTransactionOnChain({
 }) {
   try {
     if (chain === 'bsc') {
-      const provider = new ethers.JsonRpcProvider(CHAIN_RPC_URLS.bsc);
+      const provider = await getWorkingProvider('bsc');
       const receipt = await provider.getTransactionReceipt(transactionHash);
       const tx = await provider.getTransaction(transactionHash);
 
@@ -45,7 +94,7 @@ export async function verifyTransactionOnChain({
       const USDT_CONTRACT_ADDRESS = '0x55d398326f99059fF775485246999027B3197955';
 
       const usdtTransferLog = receipt.logs
-        .map((log) => {
+        .map((log: any) => {
           try {
             return {
               ...usdtInterface.parseLog(log),
@@ -55,13 +104,17 @@ export async function verifyTransactionOnChain({
             return null;
           }
         })
-        .find((event) => event && event.name === 'Transfer' && event.address.toLowerCase() === USDT_CONTRACT_ADDRESS.toLowerCase());
+        .find((event: any) => event && event.name === 'Transfer' && event.address.toLowerCase() === USDT_CONTRACT_ADDRESS.toLowerCase());
 
       if (!usdtTransferLog) {
         throw new Error('No USDT transfer found in this transaction');
       }
 
       const { args } = usdtTransferLog;
+      if (!args) {
+        throw new Error('Invalid transaction log args');
+      }
+      
       const amount = Number(ethers.formatUnits(args.value, 18));
 
       if (args.to !== '0xA761A68499753C68747398EB2B91eF308970c3e4') {
@@ -90,7 +143,7 @@ export async function verifyTransactionOnChain({
     }
 
     if (chain === 'solana') {
-      const connection = new Connection(CHAIN_RPC_URLS.solana, 'confirmed');
+      const connection = await getWorkingProvider('solana');
       const tx = await connection.getTransaction(transactionHash, {
         commitment: 'confirmed',
       });
